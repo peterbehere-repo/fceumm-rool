@@ -47,6 +47,9 @@ enum {
  * boards/n106.c, boards/mmc5.c, boards/69.c). */
 int32_t GetExpOutput(int channel, int32_t in);
 
+/* Feasibility spike: 0 = off, N = number of extra voices. */
+extern int FCEUI_ExtraVoices;
+
 typedef struct {
 	void (*Fill)(int Count);	/* Low quality ext sound. */
 

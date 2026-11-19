@@ -166,12 +166,81 @@ static void audio_cb(int16_t l, int16_t r)
    }
 }
 
+static FILE *wav_file;
+static unsigned long wav_frames;
+
 static size_t audio_batch_cb(const int16_t *d, size_t frames)
 {
+   if (wav_file)
+   {
+      fwrite(d, sizeof(*d), (size_t)frames * 2, wav_file);
+      wav_frames += frames;
+   }
    samples += frames;
    if (do_hash)
       hash_into(&audio_hash, (const unsigned char *)d, frames * 2 * sizeof(*d));
    return frames;
+}
+
+/* --wav: dump the core's audio output as 16-bit stereo, so a change can
+ * be listened to and not just hashed. The sizes are patched at exit. */
+static void put_u32(unsigned long v)
+{
+   unsigned char b[4];
+   b[0] = (unsigned char)(v & 0xFF);
+   b[1] = (unsigned char)((v >> 8) & 0xFF);
+   b[2] = (unsigned char)((v >> 16) & 0xFF);
+   b[3] = (unsigned char)((v >> 24) & 0xFF);
+   fwrite(b, 1, 4, wav_file);
+}
+
+static void put_u16(unsigned v)
+{
+   unsigned char b[2];
+   b[0] = (unsigned char)(v & 0xFF);
+   b[1] = (unsigned char)((v >> 8) & 0xFF);
+   fwrite(b, 1, 2, wav_file);
+}
+
+/* 16-bit stereo at 48 kHz; FCEUmm's libretro frontend output rate is
+ * fixed at 48 kHz with the options this harness sets. */
+static void wav_open(const char *path)
+{
+   wav_file = fopen(path, "wb");
+   if (!wav_file)
+   {
+      fprintf(stderr, "play_rom: cannot write %s\n", path);
+      exit(2);
+   }
+   fwrite("RIFF", 1, 4, wav_file);
+   put_u32(0);                       /* patched at close */
+   fwrite("WAVE", 1, 4, wav_file);
+   fwrite("fmt ", 1, 4, wav_file);
+   put_u32(16);
+   put_u16(1);                       /* PCM */
+   put_u16(2);                       /* channels */
+   put_u32(48000);
+   put_u32(48000 * 4);               /* byte rate */
+   put_u16(4);                       /* block align */
+   put_u16(16);                      /* bits */
+   fwrite("data", 1, 4, wav_file);
+   put_u32(0);                       /* patched at close */
+}
+
+static void wav_close(void)
+{
+   unsigned long data, riff;
+
+   if (!wav_file)
+      return;
+   data = wav_frames * 4;
+   riff = data + 36;
+   fseek(wav_file, 4, SEEK_SET);
+   put_u32(riff);
+   fseek(wav_file, 40, SEEK_SET);
+   put_u32(data);
+   fclose(wav_file);
+   wav_file = NULL;
 }
 
 static void input_poll_cb(void) { }
@@ -485,7 +554,7 @@ int main(int argc, char **argv)
       fprintf(stderr,
             "usage: %s core rom [--frames N] [--sysdir DIR] [--time] [--verbose]\n"
             "       [--input SCRIPT] [--shot FRAME:PATH] [--save FRAME:PATH]\n"
-            "       [--load PATH] [key=value ...]\n",
+            "       [--load PATH] [--wav PATH] [key=value ...]\n",
             argv[0]);
       return 2;
    }
@@ -501,6 +570,7 @@ int main(int argc, char **argv)
       if (!strcmp(argv[i], "--offset") && i + 1 < argc) { frame_offset = (unsigned long)strtoul(argv[++i], NULL, 10); continue; }
       if (!strcmp(argv[i], "--input") && i + 1 < argc) { parse_input(argv[++i]); continue; }
       if (!strcmp(argv[i], "--load") && i + 1 < argc)  { load_state_path = argv[++i]; continue; }
+      if (!strcmp(argv[i], "--wav") && i + 1 < argc)   { wav_open(argv[++i]); continue; }
       if (!strcmp(argv[i], "--shot") && i + 1 < argc)
       {
          unsigned long f;
@@ -649,6 +719,7 @@ int main(int argc, char **argv)
       }
    }
    t0 = clock() - t0;
+   wav_close();
 
    if (do_hash)
       fprintf(stdout, "frames %lu drawn %u duped %u null %u video %08lx audio %08lx samples %lu\n",

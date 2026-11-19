@@ -99,6 +99,9 @@ static const int RectDuties[4] = { 1, 2, 4, 6 };
 static int32_t RectDutyCount[2];
 static uint8_t sweepon[2];
 static int32_t curfreq[2];
+
+static void CaptureExtraVoice(int x);
+
 static uint8_t SweepCount[2];
 static uint8_t sweepReload[2];
 
@@ -273,6 +276,10 @@ static DECLFW(Write_PSG) {
 		break;
 	case 0x3:
 		DoSQ1();
+		if (FCEUI_ExtraVoices && (EnabledChannels & 1) && lengthcount[0] &&
+			((EnvUnits[0].Mode & 1) ? EnvUnits[0].Speed : EnvUnits[0].decvolume) > 0 &&
+			curfreq[0] != ((curfreq[0] & 0xFF) | ((V & 7) << 8)))
+			CaptureExtraVoice(0);
 		SQReload(0, V);
 		break;
 	case 0x4:
@@ -294,6 +301,10 @@ static DECLFW(Write_PSG) {
 		break;
 	case 0x7:
 		DoSQ2();
+		if (FCEUI_ExtraVoices && (EnabledChannels & 2) && lengthcount[1] &&
+			((EnvUnits[1].Mode & 1) ? EnvUnits[1].Speed : EnvUnits[1].decvolume) > 0 &&
+			curfreq[1] != ((curfreq[1] & 0xFF) | ((V & 7) << 8)))
+			CaptureExtraVoice(1);
 		SQReload(1, V);
 		break;
 	case 0xa:
@@ -614,6 +625,112 @@ static void WaveHiAddRun(int32_t *D, int32_t n, int32_t value) {
  * and never reaches it. */
 #define HQ_SPAN(count, left) \
 	(((count) > 0 && (count) < (left)) ? (count) : (left))
+
+/* ---- Extra voices (feasibility spike) ------------------------------------
+ * On real hardware a pulse channel is monophonic: writing a new pitch to
+ * $4003/$4007 stops whatever was playing.  When FCEUI_ExtraVoices is
+ * non-zero, the note being stopped is copied into a spare voice at that
+ * moment and mixed into the same linear field the expansion chips use,
+ * so it fades out underneath the new note instead of being erased.
+ *
+ * The copied voice keeps the pitch, duty and phase of the note it came
+ * from and loses a fixed slice of amplitude each frame.  It is an
+ * approximation of a release tail, not a full second APU: there is no
+ * envelope unit, no sweep and no length counter of its own.
+ *
+ * While the option is off, none of this runs and output is unchanged.
+ */
+#define MAX_EXTRA_VOICES 4
+#define EXTRAVOICE_SCALE 162		/* volume 15 => 2430, about wlookup1[15] */
+#define EXTRAVOICE_FADE_FRAMES 18
+
+typedef struct {
+	int32_t active;
+	int32_t freq;		/* period of the carried-over note */
+	int32_t duty;		/* 0..3 */
+	int32_t amp;		/* linear amplitude in the mix field */
+	int32_t ampdec;		/* amplitude lost per frame */
+	int32_t phase;		/* position in the 8-step duty cycle */
+	int32_t cnt;		/* steps until the next duty step */
+	int32_t pos;		/* next SOUNDTS step still to render */
+} EXTRAVOICE;
+
+static EXTRAVOICE ExtraVoice[MAX_EXTRA_VOICES];
+static int32_t ExtraVoiceNext;
+int FCEUI_ExtraVoices = 0;
+
+static void CaptureExtraVoice(int x) {
+	EXTRAVOICE *v;
+	int32_t vol = (EnvUnits[x].Mode & 1) ? EnvUnits[x].Speed : EnvUnits[x].decvolume;
+	int32_t slots = FCEUI_ExtraVoices;
+
+	if (vol <= 0)
+		return;
+	if (slots > MAX_EXTRA_VOICES)
+		slots = MAX_EXTRA_VOICES;
+	if (slots < 1)
+		slots = 1;
+
+	v = &ExtraVoice[ExtraVoiceNext];
+	ExtraVoiceNext = (ExtraVoiceNext + 1) % slots;
+
+	v->active = 1;
+	v->freq   = curfreq[x];
+	v->duty   = (PSG[x << 2] >> 6) & 3;
+	v->amp    = vol * EXTRAVOICE_SCALE;
+	v->ampdec = v->amp / EXTRAVOICE_FADE_FRAMES;
+	if (v->ampdec < 1)
+		v->ampdec = 1;
+	v->phase  = RectDutyCount[x] & 7;
+	v->cnt    = wlcount[x];
+	v->pos    = (int32_t)SOUNDTS;
+}
+
+/* Mix each live voice from where it left off up to SOUNDTS, then fade it
+ * by one frame's worth of amplitude. */
+static void RenderExtraVoices(void) {
+	int i;
+
+	for (i = 0; i < MAX_EXTRA_VOICES; i++) {
+		EXTRAVOICE *v = &ExtraVoice[i];
+		int32_t cf, thresh;
+
+		if (!v->active)
+			continue;
+		if (v->pos > (int32_t)SOUNDTS)	/* state restored mid-frame */
+			v->pos = 0;
+
+		cf = (v->freq + 1) * 2;
+		thresh = RectDuties[v->duty];
+
+		while (v->pos < (int32_t)SOUNDTS) {
+			int32_t left = (int32_t)SOUNDTS - v->pos;
+			int32_t n;
+
+			if (v->cnt > 0 && v->cnt < left)
+				n = v->cnt;
+			else
+				n = left;
+
+			if (v->phase < thresh && v->cnt > 0)
+				WaveHiAddRun(&WaveHi[v->pos], n, v->amp);
+
+			v->pos += n;
+			v->cnt -= n;
+			if (v->cnt <= 0) {
+				v->cnt = cf;
+				v->phase = (v->phase + 1) & 7;
+			}
+		}
+
+		v->amp -= v->ampdec;
+		if (v->amp <= 0) {
+			v->amp = 0;
+			v->active = 0;
+		}
+	}
+}
+
 
 static INLINE void RDoSQ(int x) {
 	int32_t V;
@@ -1098,6 +1215,7 @@ int FlushEmulateSound(void) {
 	if (FSettings.soundq >= 1) {
 		int32_t *tmpo = &WaveHi[soundtsoffs];
 
+		RenderExtraVoices();
 		if (GameExpSound.HiFill) GameExpSound.HiFill();
 
 		for (x = sound_timestamp; x; x--) {

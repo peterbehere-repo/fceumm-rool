@@ -2713,6 +2713,12 @@ static void check_variables(bool startup)
          environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &av_info);
    }
 
+   var.key = "fceumm_extra_voices";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      FCEUI_ExtraVoices = atoi(var.value);	/* 0 when "disabled" */
+
    var.key = "fceumm_swapduty";
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)

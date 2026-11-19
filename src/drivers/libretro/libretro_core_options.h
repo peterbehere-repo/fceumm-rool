@@ -521,6 +521,22 @@ struct retro_core_option_v2_definition option_defs[] = {
       "enabled",
    },
    {
+      "fceumm_extra_voices",
+      "Extra Voices",
+      "Extra Voices",
+      "Feasibility spike: when a pulse channel is retriggered at a new pitch while it is still sounding, keep the old note alive in a spare voice and let it fade out instead of cutting it. Off by default; output is unchanged while disabled.",
+      NULL,
+      "audio",
+      {
+         { "disabled", NULL },
+         { "1", NULL },
+         { "2", NULL },
+         { "4", NULL },
+         { NULL, NULL },
+      },
+      "disabled",
+   },
+   {
       "fceumm_apu_5",
       "Audio Channel 5 (PCM)",
       "Channel 5 (PCM)",
