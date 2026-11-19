@@ -1,0 +1,8 @@
+# id|rom|frames|input|options|(expected line, filled in by --record)
+smoke|smoke|600||
+smoke-pal|smoke|600||fceumm_region=PAL
+goonies2-title|goonies2|600||
+goonies2-play|goonies2|1400|420:start,560:start,700:start,900-980:right,1000:a,1030-1100:left,1120-1140:up|
+goonies2-pal|goonies2|1400|420:start,560:start,700:start,900-980:right,1000:a,1030-1100:left,1120-1140:up|fceumm_region=PAL
+goonies2-composite|goonies2|1400|420:start,560:start,700:start,900-980:right,1000:a,1030-1100:left,1120-1140:up|fceumm_ntsc_filter=composite
+goonies2-ines1|goonies2-ines1|1400|420:start,560:start,700:start,900-980:right,1000:a,1030-1100:left,1120-1140:up|

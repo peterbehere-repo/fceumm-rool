@@ -17,6 +17,28 @@
  *   ./play_rom ./fceumm_libretro.so content.nes --frames 600
  *   ./play_rom ./fceumm_libretro.so content.nes --sysdir . fceumm_region=PAL
  *
+ * Driving the pad: --input takes a script of frame ranges and buttons,
+ * separated by commas or semicolons:
+ *
+ *   --input "60:start, 120-300:right, 400-420:a+b, 500+:up"
+ *
+ * A single number is one frame, A-B is a range with both ends included,
+ * A+ runs from A to the end of the run. Buttons joined by + are held
+ * together: a b select start up down left right l2 (l/r on the core's
+ * pad) r2.  Any button not named in a step is released, so steps are
+ * absolute rather than cumulative.
+ *
+ *   --shot FRAME:PATH      write that frame as a binary PPM (P6)
+ *   --save FRAME:PATH      write a savestate at that frame
+ *   --load PATH            restore a savestate before the first frame
+ *   --offset N             add N to the frame number the input script and
+ *                          the --shot/--save frames are measured against,
+ *                          so a script written for a long run also works
+ *                          when resuming from a state taken part-way in
+ *   --verbose              show the core's own log output
+ *
+ * Snapshots are taken after the frame runs, so --shot 300 shows what a
+ * frontend would display for frame 300. *
  * A content file that needs a BIOS (an FDS image) reads it from the
  * system directory, which is the current directory unless --sysdir
  * names another. */
@@ -43,6 +65,43 @@ static struct retro_variable options[MAX_OPTIONS];
 static unsigned num_options;
 static const char *system_dir = ".";
 static int do_hash = 1;
+static int verbose = 0;
+
+/* Scripted pad input. */
+#define MAX_STEPS 64
+#define MAX_SHOTS 16
+struct pad_step { unsigned long from, to; unsigned mask; };
+struct shot     { unsigned long frame; const char *path; };
+static struct pad_step steps[MAX_STEPS];
+static unsigned num_steps;
+static struct shot shots[MAX_SHOTS];
+static unsigned num_shots;
+static const char *save_frame_path;   /* --save */
+static unsigned long save_frame = (unsigned long)-1;
+static const char *load_state_path;
+
+/* libretro joypad ids, in the order the input script names them. */
+static const struct { const char *name; unsigned id; } pad_buttons[] = {
+   { "b",      RETRO_DEVICE_ID_JOYPAD_B },
+   { "y",      RETRO_DEVICE_ID_JOYPAD_Y },
+   { "select", RETRO_DEVICE_ID_JOYPAD_SELECT },
+   { "start",  RETRO_DEVICE_ID_JOYPAD_START },
+   { "up",     RETRO_DEVICE_ID_JOYPAD_UP },
+   { "down",   RETRO_DEVICE_ID_JOYPAD_DOWN },
+   { "left",   RETRO_DEVICE_ID_JOYPAD_LEFT },
+   { "right",  RETRO_DEVICE_ID_JOYPAD_RIGHT },
+   { "a",      RETRO_DEVICE_ID_JOYPAD_A },
+   { "x",      RETRO_DEVICE_ID_JOYPAD_X },
+   { "l",      RETRO_DEVICE_ID_JOYPAD_L },
+   { "r",      RETRO_DEVICE_ID_JOYPAD_R },
+   { "l2",     RETRO_DEVICE_ID_JOYPAD_L2 },
+   { "r2",     RETRO_DEVICE_ID_JOYPAD_R2 },
+   { NULL, 0 }
+};
+#define NUM_PAD_BUTTONS (sizeof(pad_buttons) / sizeof(pad_buttons[0]) - 1)
+
+static unsigned long current_frame;
+static unsigned long frame_offset;
 
 static unsigned long video_hash  = 2166136261UL;
 static unsigned long audio_hash  = 2166136261UL;
@@ -70,6 +129,9 @@ static void fold_hash(void)
    prev_frame_hash = frame_hash;
 }
 
+static const void *last_frame;
+static size_t last_pitch;
+
 static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
 {
    unsigned y;
@@ -81,6 +143,8 @@ static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
    }
    video_w = w;
    video_h = h;
+   last_frame = data;
+   last_pitch = pitch;
    frames_drawn++;
    if (do_hash)
    {
@@ -112,20 +176,193 @@ static size_t audio_batch_cb(const int16_t *d, size_t frames)
 
 static void input_poll_cb(void) { }
 
+/* The mask in force for the frame being run: the last step whose range
+ * covers the current frame, or nothing if no step has started yet. */
+static unsigned pad_mask(unsigned long frame)
+{
+   unsigned i;
+   /* steps are stored in the order written; later steps win */
+   for (i = num_steps; i > 0; i--)
+   {
+      const struct pad_step *st = &steps[i - 1];
+      if (frame >= st->from && frame <= st->to)
+         return st->mask;
+   }
+   return 0;
+}
+
 static int16_t input_state_cb(unsigned port, unsigned dev, unsigned idx, unsigned id)
 {
-   (void)port; (void)dev; (void)idx; (void)id;
-   return 0;
+   unsigned mask;
+   (void)idx;
+   if (port != 0 || dev != RETRO_DEVICE_JOYPAD)
+      return 0;
+   mask = pad_mask(current_frame);
+   return (mask & (1u << id)) ? 1 : 0;
 }
 
 static void log_cb(enum retro_log_level level, const char *fmt, ...)
 {
    va_list ap;
-   if (level < RETRO_LOG_WARN)
+   if (level < (verbose ? RETRO_LOG_DEBUG : RETRO_LOG_WARN))
       return;
    va_start(ap, fmt);
    vfprintf(stderr, fmt, ap);
    va_end(ap);
+}
+
+
+/* Write the most recently shown frame as a binary PPM, which is what a
+ * frontend would be displaying at that moment. */
+static void write_ppm(const char *path, const void *data,
+      unsigned w, unsigned h, size_t pitch)
+{
+   FILE *f;
+   unsigned x, y;
+   size_t bytes = pixel_bytes;
+
+   if (!data || !w || !h)
+   {
+      fprintf(stderr, "no frame to write for %s\n", path);
+      return;
+   }
+   f = fopen(path, "wb");
+   if (!f)
+   {
+      fprintf(stderr, "cannot write %s\n", path);
+      return;
+   }
+   fprintf(f, "P6\n%u %u\n255\n", w, h);
+   for (y = 0; y < h; y++)
+   {
+      const unsigned char *row = (const unsigned char *)data + (size_t)y * pitch;
+      for (x = 0; x < w; x++)
+      {
+         const unsigned char *px = row + (size_t)x * bytes;
+         unsigned char rgb[3];
+         if (bytes == 4)   /* 0RGB1555 in the low two bytes of each word */
+         {
+            unsigned v = (unsigned)px[0] | ((unsigned)px[1] << 8);
+            unsigned r5 = (v >> 10) & 0x1F, g5 = (v >> 5) & 0x1F, b5 = v & 0x1F;
+            rgb[0] = (unsigned char)((r5 << 3) | (r5 >> 2));
+            rgb[1] = (unsigned char)((g5 << 3) | (g5 >> 2));
+            rgb[2] = (unsigned char)((b5 << 3) | (b5 >> 2));
+         }
+         else              /* RGB565 */
+         {
+            unsigned v = (unsigned)px[0] | ((unsigned)px[1] << 8);
+            unsigned r5 = (v >> 11) & 0x1F, g6 = (v >> 5) & 0x3F, b5 = v & 0x1F;
+            rgb[0] = (unsigned char)((r5 << 3) | (r5 >> 2));
+            rgb[1] = (unsigned char)((g6 << 2) | (g6 >> 4));
+            rgb[2] = (unsigned char)((b5 << 3) | (b5 >> 2));
+         }
+         fwrite(rgb, 1, 3, f);
+      }
+   }
+   fclose(f);
+   fprintf(stderr, "frame %lu -> %s\n", current_frame, path);
+}
+
+/* Parse "A:B" into a frame number and a path. */
+static int split_frame_path(const char *arg, unsigned long *frame, const char **path)
+{
+   char *end;
+   unsigned long v = strtoul(arg, &end, 10);
+   if (end == arg || *end != ':')
+      return 0;
+   *frame = v;
+   *path  = end + 1;
+   return 1;
+}
+
+static unsigned parse_buttons(const char *s, const char *whole)
+{
+   unsigned mask = 0;
+   while (*s)
+   {
+      const char *start = s;
+      size_t len;
+      unsigned b;
+      int found = 0;
+      while (*s && *s != '+')
+         s++;
+      len = (size_t)(s - start);
+      for (b = 0; b < NUM_PAD_BUTTONS; b++)
+         if (strlen(pad_buttons[b].name) == len
+               && !strncmp(pad_buttons[b].name, start, len))
+         {
+            mask |= 1u << pad_buttons[b].id;
+            found = 1;
+            break;
+         }
+      if (!found)
+         fprintf(stderr, "unknown button in \"%s\": %.*s\n", whole, (int)len, start);
+      if (*s == '+')
+         s++;
+   }
+   return mask;
+}
+
+/* "60:start", "120-300:right", "500+:up", steps separated by , or ; */
+static void parse_input(const char *script)
+{
+   const char *p = script;
+   while (*p)
+   {
+      unsigned long from, to;
+      char *end;
+      const char *seg_end;
+      size_t len;
+      char buf[128];
+
+      while (*p == ',' || *p == ';' || *p == ' ')
+         p++;
+      if (!*p)
+         break;
+      seg_end = p;
+      while (*seg_end && *seg_end != ',' && *seg_end != ';')
+         seg_end++;
+      len = (size_t)(seg_end - p);
+      if (len >= sizeof(buf))
+         len = sizeof(buf) - 1;
+      memcpy(buf, p, len);
+      buf[len] = 0;
+
+      from = strtoul(buf, &end, 10);
+      if (end == buf)
+      {
+         fprintf(stderr, "bad input step \"%s\"\n", buf);
+         p = seg_end;
+         continue;
+      }
+      if (*end == '-')
+      {
+         to = strtoul(end + 1, &end, 10);
+      }
+      else if (*end == '+')
+      {
+         to = (unsigned long)-1;
+         end++;
+      }
+      else
+         to = from;
+      if (*end != ':')
+      {
+         fprintf(stderr, "input step needs buttons: \"%s\"\n", buf);
+         p = seg_end;
+         continue;
+      }
+      if (num_steps < MAX_STEPS)
+      {
+         steps[num_steps].from = from;
+         steps[num_steps].to   = to;
+         steps[num_steps].mask = parse_buttons(end + 1, buf);
+         num_steps++;
+      }
+      else
+         fprintf(stderr, "too many input steps, ignoring \"%s\"\n", buf);
+      p = seg_end;
+   }
 }
 
 static bool env_cb(unsigned cmd, void *data)
@@ -182,6 +419,9 @@ typedef struct
    void (*run)(void);
    void (*get_system_info)(struct retro_system_info *);
    void (*get_av_info)(struct retro_system_av_info *);
+   size_t (*serialize_size)(void);
+   bool (*serialize)(void *, size_t);
+   bool (*unserialize)(const void *, size_t);
 } core_t;
 
 static int load_sym(void *lib, const char *name, void *dst)
@@ -243,7 +483,9 @@ int main(int argc, char **argv)
    if (argc < 3)
    {
       fprintf(stderr,
-            "usage: %s core rom [--frames N] [--sysdir DIR] [--time] [key=value ...]\n",
+            "usage: %s core rom [--frames N] [--sysdir DIR] [--time] [--verbose]\n"
+            "       [--input SCRIPT] [--shot FRAME:PATH] [--save FRAME:PATH]\n"
+            "       [--load PATH] [key=value ...]\n",
             argv[0]);
       return 2;
    }
@@ -255,6 +497,26 @@ int main(int argc, char **argv)
       if (!strcmp(argv[i], "--time"))       { do_hash = 0; continue; }
       if (!strcmp(argv[i], "--frames") && i + 1 < argc) { want = (unsigned long)strtoul(argv[++i], NULL, 10); continue; }
       if (!strcmp(argv[i], "--sysdir") && i + 1 < argc) { system_dir = argv[++i]; continue; }
+      if (!strcmp(argv[i], "--verbose"))    { verbose = 1; continue; }
+      if (!strcmp(argv[i], "--offset") && i + 1 < argc) { frame_offset = (unsigned long)strtoul(argv[++i], NULL, 10); continue; }
+      if (!strcmp(argv[i], "--input") && i + 1 < argc) { parse_input(argv[++i]); continue; }
+      if (!strcmp(argv[i], "--load") && i + 1 < argc)  { load_state_path = argv[++i]; continue; }
+      if (!strcmp(argv[i], "--shot") && i + 1 < argc)
+      {
+         unsigned long f;
+         const char *path;
+         if (!split_frame_path(argv[++i], &f, &path))
+         { fprintf(stderr, "--shot needs FRAME:PATH\n"); return 2; }
+         if (num_shots < MAX_SHOTS)
+         { shots[num_shots].frame = f; shots[num_shots].path = path; num_shots++; }
+         continue;
+      }
+      if (!strcmp(argv[i], "--save") && i + 1 < argc)
+      {
+         if (!split_frame_path(argv[++i], &save_frame, &save_frame_path))
+         { fprintf(stderr, "--save needs FRAME:PATH\n"); return 2; }
+         continue;
+      }
       {
          char *eq = strchr(argv[i], '=');
          if (!eq || num_options >= MAX_OPTIONS)
@@ -290,6 +552,13 @@ int main(int argc, char **argv)
          || !load_sym(lib, "retro_get_system_info", &c.get_system_info)
          || !load_sym(lib, "retro_get_system_av_info", &c.get_av_info))
       return 1;
+
+   /* States are optional: a core that does not offer them can still be
+    * played, it just cannot be asked for one. */
+   if (!load_sym(lib, "retro_serialize_size", &c.serialize_size)
+         || !load_sym(lib, "retro_serialize", &c.serialize)
+         || !load_sym(lib, "retro_unserialize", &c.unserialize))
+      c.serialize_size = NULL;
 
    c.set_environment(env_cb);
    c.set_video_refresh(video_cb);
@@ -332,9 +601,53 @@ int main(int argc, char **argv)
          (double)av.timing.fps, (double)av.timing.sample_rate,
          av.geometry.base_width, av.geometry.base_height);
 
+   if (load_state_path && c.serialize_size)
+   {
+      size_t size;
+      unsigned char *state = read_file(load_state_path, &size);
+      if (!state)
+         return 1;
+      if (!c.unserialize(state, size))
+      {
+         fprintf(stderr, "core refused state %s\n", load_state_path);
+         free(state);
+         return 1;
+      }
+      free(state);
+      fprintf(stderr, "state %s loaded\n", load_state_path);
+   }
+
    t0 = clock();
    for (frames = 0; frames < want; frames++)
+   {
+      unsigned i;
+      current_frame = frames + frame_offset;
       c.run();
+      for (i = 0; i < num_shots; i++)
+         if (shots[i].frame == current_frame)
+            write_ppm(shots[i].path, last_frame, video_w, video_h, last_pitch);
+      if (current_frame == save_frame && c.serialize_size && save_frame_path)
+      {
+         size_t size = c.serialize_size();
+         void *state = malloc(size ? size : 1);
+         if (state && size && c.serialize(state, size))
+         {
+            FILE *f = fopen(save_frame_path, "wb");
+            if (f)
+            {
+               fwrite(state, 1, size, f);
+               fclose(f);
+               fprintf(stderr, "state of frame %lu -> %s (%lu bytes)\n",
+                     current_frame, save_frame_path, (unsigned long)size);
+            }
+            else
+               fprintf(stderr, "cannot write %s\n", save_frame_path);
+         }
+         else
+            fprintf(stderr, "core refused to serialize at frame %lu\n", frames);
+         free(state);
+      }
+   }
    t0 = clock() - t0;
 
    if (do_hash)

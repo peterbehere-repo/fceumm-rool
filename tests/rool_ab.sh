@@ -11,6 +11,10 @@
 #   make -f Makefile.libretro -j2 && cp fceumm_libretro.so /tmp/new.so
 #   git stash && make -f Makefile.libretro -j2 && git stash pop
 #   tests/rool_ab.sh fceumm_libretro.so /tmp/new.so content.nes
+#
+# Set INPUT to a pad script (see play_rom.c) to compare builds past a
+# title screen, e.g. INPUT="420:start,560:start,700:start" -- comparing
+# builds on a title screen exercises very little of the machine.
 
 set -u
 
@@ -48,12 +52,20 @@ fceumm_show_adv_options=enabled fceumm_sndstereodelay=15_ms_delay"
 
 diffs=$(mktemp)
 trap 'rm -f "$diffs"' EXIT
+run() {
+   if [ -n "${INPUT:-}" ]; then
+      "$play" "$1" "$rom" --frames "$frames" --input "$INPUT" $opts 2>/dev/null | tail -1
+   else
+      "$play" "$1" "$rom" --frames "$frames" $opts 2>/dev/null | tail -1
+   fi
+}
+
 status=0
 for rom in "$@"; do
    echo "== $(basename "$rom")"
    echo "$sets" | while IFS= read -r opts; do
-      line_a=$("$play" "$a" "$rom" --frames "$frames" $opts 2>/dev/null | tail -1)
-      line_b=$("$play" "$b" "$rom" --frames "$frames" $opts 2>/dev/null | tail -1)
+      line_a=$(run "$a")
+      line_b=$(run "$b")
       if [ "$line_a" = "$line_b" ] && [ -n "$line_a" ]; then
          printf '  ok    %s\n' "${opts:-default options}"
       else

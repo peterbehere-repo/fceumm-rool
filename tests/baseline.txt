@@ -1,0 +1,7 @@
+smoke|smoke|600|||frames 600 drawn 600 duped 1 null 0 video 80bec8e8 audio ed19e9c9 samples 479185
+smoke-pal|smoke|600||fceumm_region=PAL|frames 600 drawn 600 duped 1 null 0 video 80bec8e8 audio 8d7c80c1 samples 575896
+goonies2-title|goonies2|600|||frames 600 drawn 600 duped 356 null 0 video 19e6864e audio 432153e5 samples 479178
+goonies2-play|goonies2|1400|420:start,560:start,700:start,900-980:right,1000:a,1030-1100:left,1120-1140:up||frames 1400 drawn 1400 duped 771 null 0 video 28109d42 audio d7f5aadd samples 1118089
+goonies2-pal|goonies2|1400|420:start,560:start,700:start,900-980:right,1000:a,1030-1100:left,1120-1140:up|fceumm_region=PAL|frames 1400 drawn 1400 duped 770 null 0 video 59cb108c audio 918bc1f5 samples 1343752
+goonies2-composite|goonies2|1400|420:start,560:start,700:start,900-980:right,1000:a,1030-1100:left,1120-1140:up|fceumm_ntsc_filter=composite|frames 1400 drawn 1400 duped 67 null 0 video 22ebc388 audio d7f5aadd samples 1118089
+goonies2-ines1|goonies2-ines1|1400|420:start,560:start,700:start,900-980:right,1000:a,1030-1100:left,1120-1140:up||frames 1400 drawn 1400 duped 771 null 0 video 28109d42 audio d7f5aadd samples 1118089
